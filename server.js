@@ -228,7 +228,7 @@ const SPOT_WS = [
 ];
 const FUT_WS = [
   s => 'wss://fstream.binance.com:443/stream?streams=' + s,
-  s => 'wss://fstream.binance.com:443/market/ws/' + s
+  s => 'wss://fstream.binance.com:443/market/' + s
 ];
 
 function connectWs(){
