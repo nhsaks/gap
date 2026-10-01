@@ -1,15 +1,25 @@
 {
   "name": "delta-neutral-simulator",
   "version": "1.0.0",
-  "description": "Delta Neutral Simulator running 24/7 on Render",
+  "description": "Delta Neutral Simulator — spot/futures gap fade with autopilot, running 24/7 on Render",
   "main": "server.js",
+  "private": true,
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node server.js"
   },
   "dependencies": {
     "express": "^4.19.2"
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "keywords": [
+    "delta-neutral",
+    "binance",
+    "spot-futures",
+    "arbitrage",
+    "simulator"
+  ],
+  "license": "MIT"
 }
