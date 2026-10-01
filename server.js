@@ -1,633 +1,125 @@
-'use strict';
-const express = require('express');
-const WebSocket = require('ws');
-const fs = require('fs');
-const path = require('path');
-
-const PORT = process.env.PORT || 3000;
-const STATE_FILE = path.join(__dirname, 'state.json');
-
-const FRESH_MS = 15000;
-const QUEUE_TTL = 180000;
-const WS_SILENT = 25000;
-const MAX_MULT = 10;
-const STRENGTH_REF = 0.005;
-const RECOVER_MULT = 0.5;
-const ENTRY_COOLDOWN = 900;
-
-const DEFAULT_SYMBOLS = ["AVAX","SUI","DOT","ATOM","ICP","NEAR","APT","ARB","OP","INJ","TIA","SEI","FIL","LTC","LINK"];
-const DEFAULT_CHECKED = ["AVAX","SUI","DOT","ATOM","ICP","NEAR","APT","INJ"];
-
-const state = {
-  symbols: [...DEFAULT_SYMBOLS],
-  checked: [...DEFAULT_CHECKED],
-  spot: {}, fut: {}, tickAt: {}, tickSizes: {}, lastRest: {},
-  positions: [], queue: [],
-  posSeq: 1,
-  sessionStart: Date.now(),
-  realizedPnl: 0, realizedFees: 0,
-  tradeCount: 0, wins: 0, losses: 0,
-  settings: {
-    autopilot: false, gapFilter: true,
-    longGap: 10, shortGap: 10,
-    apTarget: 0.05, maxOpen: 5, sl: 0.15,
-    amt: 10, fee: 0,
-    normEnabled: true, normalizeLoss: 0.01, normalizeProfit: 0.10,
-    tp: 0.05, driftUp: 0, driftDn: 0, refreshSec: 3,
-    target: '*'
-  },
-  logs: [],
-  lastTickAt: 0,
-  lastEntryAt: 0,
-  apCycles: 0,
-  ws: { spotOpen: false, futOpen: false, lastMsg: 0 },
-  restBusy: false
-};
-
-function log(msg, cls) {
-  const t = new Date().toISOString().slice(11,19);
-  state.logs.unshift({ t, msg, cls: cls || '' });
-  if (state.logs.length > 200) state.logs.length = 200;
-  console.log(`[${t}] ${String(msg).replace(/<[^>]+>/g,'')}`);
-}
-
-const normSym = s => String(s || '').toUpperCase().trim();
-const spotPx = s => state.spot[normSym(s)] ?? null;
-const futPx  = s => state.fut[normSym(s)] ?? null;
-const isFresh = (s, ms = FRESH_MS) => {
-  const t = state.tickAt[normSym(s)];
-  return t != null && (Date.now() - t) <= ms;
-};
-const freshSpot = s => isFresh(s) ? spotPx(s) : null;
-const freshFut  = s => isFresh(s) ? futPx(s) : null;
-
-function setSpot(sym, p){ const S=normSym(sym); const v=parseFloat(p); if(!isFinite(v)||v<=0) return false; state.spot[S]=v; state.tickAt[S]=Date.now(); state.lastTickAt=Date.now(); return true; }
-function setFut(sym, p){  const S=normSym(sym); const v=parseFloat(p); if(!isFinite(v)||v<=0) return false; state.fut[S]=v;  state.tickAt[S]=Date.now(); state.lastTickAt=Date.now(); return true; }
-
-function defaultTickSize(price){
-  if (price == null || !isFinite(price) || price <= 0) return 0.01;
-  if (price >= 10000) return 0.10;
-  if (price >= 100) return 0.01;
-  if (price >= 1) return 0.001;
-  if (price >= 0.1) return 0.0001;
-  if (price >= 0.01) return 0.00001;
-  return 0.000001;
-}
-function tickSizeFor(sym){
-  const S = normSym(sym);
-  if (state.tickSizes[S] > 0) return state.tickSizes[S];
-  const p = spotPx(S) ?? futPx(S);
-  return defaultTickSize(p);
-}
-function gapTicks(sym){
-  const S=normSym(sym); const sp=spotPx(S), fu=futPx(S);
-  if (sp==null||fu==null||sp<=0) return null;
-  const tick = tickSizeFor(S); if (!tick) return null;
-  return (fu - sp) / tick;
-}
-function gapPct(sym){
-  const S=normSym(sym); const sp=spotPx(S), fu=futPx(S);
-  if (sp==null||fu==null||sp<=0) return null;
-  return ((fu - sp) / sp) * 100;
-}
-
-const feePct        = () => { const v=parseFloat(state.settings.fee); return (isFinite(v)&&v>0)? v/100 : 0; };
-const normEnabled   = () => state.settings.normEnabled;
-const gapEnabled    = () => state.settings.gapFilter;
-const longGapTicks  = () => { const v=parseFloat(state.settings.longGap);  return (isFinite(v)&&v>=1)? v : 10; };
-const shortGapTicks = () => { const v=parseFloat(state.settings.shortGap); return (isFinite(v)&&v>=1)? v : 10; };
-const normalizeLoss   = () => { const v=parseFloat(state.settings.normalizeLoss);   return (isFinite(v)&&v>0)? v : 0.01; };
-const normalizeProfit = () => { const v=parseFloat(state.settings.normalizeProfit); return (isFinite(v)&&v>0)? v : 0.10; };
-
-function gapConfirms(sym, side){
-  if (!gapEnabled()) return { ok: true, ticks: null };
-  const ticks = gapTicks(sym);
-  if (ticks == null) return { ok: false, ticks: null };
-  if (side === 'SHORT') return { ok: ticks >=  longGapTicks(), ticks };
-  return { ok: ticks <= -shortGapTicks(), ticks };
-}
-
-function signalFor(sym){
-  const S = normSym(sym);
-  const sp = freshSpot(S), fu = freshFut(S);
-  if (sp == null || fu == null || sp <= 0) return null;
-  const gap = (fu - sp) / sp;
-  if (Math.abs(gap) < 1e-12) return null;
-  return { spot: sp, fut: fu, gap, side: gap > 0 ? 'SHORT' : 'LONG' };
-}
-
-function grossAt(pos, cur){
-  if (cur == null || !isFinite(cur)) return 0;
-  return pos.side === 'LONG' ? (cur - pos.entry) * pos.amt : (pos.entry - cur) * pos.amt;
-}
-const netAt = (pos, cur) => grossAt(pos, cur) - pos.fees;
-function totalNet(freshOnly){
-  let sum = 0;
-  for (const p of state.positions){
-    const c = freshOnly ? freshFut(p.sym) : futPx(p.sym);
-    if (c == null){ if (freshOnly) return null; continue; }
-    sum += netAt(p, c);
-  }
-  return sum;
-}
-function lossGateOpen(){
-  if (!normEnabled()) return true;
-  if (state.positions.length === 0) return true;
-  const nt = totalNet(true);
-  if (nt == null) return false;
-  return nt <= -normalizeLoss();
-}
-
-function findPosIndex(sym, side){
-  const S = normSym(sym);
-  return state.positions.findIndex(p => normSym(p.sym) === S && p.side === side);
-}
-
-function executeOpen(sym, side, amt, source, notional, forcedPx, spotRef){
-  const S = normSym(sym);
-  const price = (forcedPx != null && isFinite(forcedPx)) ? forcedPx : freshFut(S);
-  if (price == null) return false;
-  if (!isFinite(amt) || amt <= 0) return false;
-  if (!notional) notional = amt * price;
-
-  const f = feePct();
-  const addFee = amt * price * f;
-  const idx = findPosIndex(S, side);
-
-  if (idx !== -1){
-    const p = state.positions[idx];
-    const oldAmt = p.amt, oldEntry = p.entry;
-    const newAmt = oldAmt + amt;
-    const newEntry = (oldEntry * oldAmt + price * amt) / newAmt;
-    p.entry = newEntry; p.amt = newAmt; p.fees += addFee;
-    p.adds = (p.adds || 1) + 1;
-    p.notional = (p.notional || (oldAmt * oldEntry)) + notional;
-    if (spotRef != null) p.spot = spotRef;
-    log(`⟳ AVERAGE ${side} ${S}: ${amt.toFixed(4)} @ ${price} (×${p.adds})`, 'pos');
-  } else {
-    state.positions.push({
-      id: state.posSeq++, sym: S, side, entry: price, amt, fees: addFee,
-      adds: 1, notional, openedAt: Date.now(), spot: spotRef ?? spotPx(S) ?? null
-    });
-    const tag = source === 'auto' ? ' [gap]' : source === 'queue' ? ' [queued]' : '';
-    log(`✚ OPEN ${side} ${S}: ${amt.toFixed(4)} @ ${price} ($${notional.toFixed(2)})${tag}`, 'pos');
-  }
-  saveState();
-  return true;
-}
-
-function closePos(id, reason, usePx){
-  const idx = state.positions.findIndex(p => p.id === id);
-  if (idx < 0) return false;
-  const p = state.positions[idx];
-  let cur = (usePx != null && isFinite(usePx)) ? usePx : freshFut(p.sym);
-  if (cur == null) cur = futPx(p.sym) ?? p.entry;
-
-  const f = feePct();
-  p.fees += p.amt * cur * f;
-  const net = grossAt(p, cur) - p.fees;
-
-  state.realizedPnl += net;
-  state.realizedFees += p.fees;
-  state.tradeCount++;
-  if (net >= 0) state.wins++; else state.losses++;
-
-  log(`${reason || 'CLOSE'} ${p.side} ${p.sym} → ${net>=0?'+':''}${net.toFixed(4)}`, net>=0 ? 'pos' : 'neg');
-
-  state.positions.splice(idx, 1);
-  saveState();
-  return true;
-}
-
-function closeAll(reason){
-  if (!state.positions.length) return false;
-  [...state.positions].forEach(p => closePos(p.id, reason));
-  return true;
-}
-
-function planEntry(sym, openNet){
-  const sig = signalFor(sym);
-  if (!sig) return null;
-  const base = parseFloat(state.settings.amt);
-  if (!isFinite(base) || base <= 0) return null;
-  const agap = Math.abs(sig.gap);
-  const strength = Math.min(3, Math.max(0.5, agap / STRENGTH_REF));
-  let notional = base * strength;
-  const recover = Math.max(0, -(openNet || 0));
-  if (recover > 0) notional += recover * RECOVER_MULT * strength;
-  notional = Math.min(notional, base * MAX_MULT);
-  notional = Math.max(notional, base * 0.25);
-  return { side: sig.side, notional, spot: sig.spot, fut: sig.fut, gap: sig.gap, strength };
-}
-
-/* ───────── WebSocket feeds ───────── */
-let spotWs = null, futWs = null, spotRetry = 0, futRetry = 0;
-const SPOT_WS = [
-  s => 'wss://stream.binance.com:9443/stream?streams=' + s,
-  s => 'wss://stream.binance.com:443/stream?streams=' + s
-];
-const FUT_WS = [
-  s => 'wss://fstream.binance.com/market/stream?streams=' + s,
-  s => 'wss://fstream.binance.com/market/' + s
-];
-
-function connectWs(){
-  if (spotWs){ try{ spotWs.terminate(); }catch(e){} spotWs = null; }
-  if (futWs){  try{ futWs.terminate();  }catch(e){} futWs  = null; }
-  state.ws.spotOpen = false; state.ws.futOpen = false;
-
-  const syms = [...state.symbols];
-  if (!syms.length) return;
-  const streams = syms.map(s => s.toLowerCase() + 'usdt@miniTicker').join('/');
-
-  const trySpot = (ui) => {
-    try { spotWs = new WebSocket(SPOT_WS[ui % SPOT_WS.length](streams)); }
-    catch(e){ return setTimeout(() => trySpot(ui+1), 2000); }
-    spotWs.on('open',    () => { state.ws.spotOpen = true; state.ws.lastMsg = Date.now(); });
-    spotWs.on('message', data => { try {
-      const m = JSON.parse(data); const d = m.data; if (!d || !d.s) return;
-      const sym = normSym(d.s.endsWith('USDT') ? d.s.slice(0,-4) : d.s);
-      const p = parseFloat(d.c);
-      if (!isFinite(p) || p <= 0) return;
-      state.ws.lastMsg = Date.now(); setSpot(sym, p);
-    } catch(e){} });
-    spotWs.on('close',   () => { state.ws.spotOpen = false; setTimeout(() => trySpot(ui+1), Math.min(15000, 1000*(spotRetry++ + 1))); });
-    spotWs.on('error',   () => { try{ spotWs.terminate(); }catch(e){} });
-  };
-  const tryFut = (ui) => {
-    try { futWs = new WebSocket(FUT_WS[ui % FUT_WS.length](streams)); }
-    catch(e){ return setTimeout(() => tryFut(ui+1), 2000); }
-    futWs.on('open',    () => { state.ws.futOpen = true; state.ws.lastMsg = Date.now(); });
-    futWs.on('message', data => { try {
-      const m = JSON.parse(data); const d = m.data; if (!d || !d.s) return;
-      const sym = normSym(d.s.endsWith('USDT') ? d.s.slice(0,-4) : d.s);
-      const p = parseFloat(d.c);
-      if (!isFinite(p) || p <= 0) return;
-      state.ws.lastMsg = Date.now(); setFut(sym, p);
-    } catch(e){} });
-    futWs.on('close',   () => { state.ws.futOpen = false; setTimeout(() => tryFut(ui+1), Math.min(15000, 1000*(futRetry++ + 1))); });
-    futWs.on('error',   () => { try{ futWs.terminate(); }catch(e){} });
-  };
-  trySpot(0); tryFut(0);
-}
-
-/* ───────── REST fallbacks ───────── */
-async function fetchTickSizes(){
-  try {
-    const r = await fetch('https://api.binance.com/api/v3/exchangeInfo');
-    const j = await r.json();
-    if (!j.symbols) return;
-    let n = 0;
-    for (const s of j.symbols){
-      if (!s.symbol || !s.symbol.endsWith('USDT')) continue;
-      if (s.status && s.status !== 'TRADING') continue;
-      const sym = s.symbol.slice(0,-4);
-      const f = (s.filters || []).find(x => x.filterType === 'PRICE_FILTER');
-      if (f && f.tickSize){
-        const t = parseFloat(f.tickSize);
-        if (isFinite(t) && t > 0){ state.tickSizes[sym] = t; n++; }
-      }
-    }
-    log(`📏 Loaded ${n} tick sizes`, 'pos');
-  } catch(e){ log('📏 Tick sizes fallback', 'neg'); }
-}
-async function restSpotAll(){
-  const wanted = new Set(state.symbols.map(normSym));
-  try {
-    const r = await fetch('https://api.binance.com/api/v3/ticker/24hr');
-    if (!r.ok) return 0;
-    const j = await r.json(); let n = 0;
-    for (const t of j){
-      if (!t || !t.symbol || !t.symbol.endsWith('USDT')) continue;
-      const sym = t.symbol.slice(0,-4);
-      if (!wanted.has(sym)) continue;
-      if (setSpot(sym, parseFloat(t.lastPrice))) n++;
-    }
-    return n;
-  } catch(e){ return 0; }
-}
-async function restFutAll(){
-  const wanted = new Set(state.symbols.map(normSym));
-  try {
-    const r = await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr');
-    if (!r.ok) return 0;
-    const j = await r.json(); let n = 0;
-    for (const t of j){
-      if (!t || !t.symbol || !t.symbol.endsWith('USDT')) continue;
-      const sym = t.symbol.slice(0,-4);
-      if (!wanted.has(sym)) continue;
-      if (setFut(sym, parseFloat(t.lastPrice))) n++;
-    }
-    return n;
-  } catch(e){ return 0; }
-}
-async function restSpot(sym){
-  const S = normSym(sym) + 'USDT';
-  try {
-    const r = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=' + S);
-    if (!r.ok) return null;
-    const j = await r.json();
-    const p = parseFloat(j.price);
-    if (isFinite(p) && p > 0){ setSpot(sym, p); return p; }
-  } catch(e){}
-  return null;
-}
-async function restFut(sym){
-  const S = normSym(sym) + 'USDT';
-  try {
-    const r = await fetch('https://fapi.binance.com/fapi/v1/ticker/price?symbol=' + S);
-    if (!r.ok) return null;
-    const j = await r.json();
-    const p = parseFloat(j.price);
-    if (isFinite(p) && p > 0){ setFut(sym, p); return p; }
-  } catch(e){}
-  return null;
-}
-async function restPriceBatch(syms){
-  const uniq = [...new Set(syms.map(normSym))].filter(s => state.symbols.includes(s));
-  if (!uniq.length) return;
-  await Promise.all(uniq.map(async s => {
-    if (isFresh(s, 800)) return;
-    await Promise.all([restSpot(s), restFut(s)]);
-  }));
-  flushQueue();
-}
-function refreshStale(syms){
-  const now = Date.now();
-  const uniq = [...new Set(syms.map(normSym))].filter(s =>
-    state.symbols.includes(s) && !isFresh(s) && (now - (state.lastRest[s]||0) > 1500));
-  if (!uniq.length) return;
-  uniq.forEach(s => state.lastRest[s] = now);
-  restPriceBatch(uniq);
-}
-
-function flushQueue(){
-  if (!state.queue.length) return;
-  const now = Date.now();
-  for (let i = state.queue.length - 1; i >= 0; i--){
-    const q = state.queue[i];
-    if (now - (q.at || 0) > QUEUE_TTL){ state.queue.splice(i,1); continue; }
-    const price = freshFut(q.sym);
-    if (price != null){
-      if (gapEnabled() && !gapConfirms(q.sym, q.side).ok){ state.queue.splice(i,1); continue; }
-      const qty = q.notional / price;
-      if (executeOpen(q.sym, q.side, qty, 'queue', q.notional, price, spotPx(q.sym))) state.queue.splice(i,1);
-    }
-  }
-}
-
-/* ───────── Autopilot ───────── */
-function autopilotTick(){
-  if (!state.settings.autopilot) return;
-  const syms = [...state.checked];
-  if (!syms.length) return;
-
-  const exitT = parseFloat(state.settings.apTarget);
-  if (!isFinite(exitT) || exitT <= 0) return;
-
-  const maxOpen = Math.max(1, parseInt(state.settings.maxOpen) || 5);
-  const sl = parseFloat(state.settings.sl);
-
-  [...state.positions].forEach(p => {
-    const cur = freshFut(p.sym);
-    if (cur == null) return;
-    const net = netAt(p, cur);
-    if (net >= exitT) closePos(p.id, `✅ +PnL EXIT ${net.toFixed(4)}`, cur);
-  });
-
-  const nt = totalNet(true);
-  if (nt != null && isFinite(sl) && sl > 0 && nt <= -sl){
-    log(`🛑 BASKET SL — net ${nt.toFixed(4)}`, 'neg');
-    closeAll(`AP SL ${nt.toFixed(4)}`); return;
-  }
-  if (normEnabled() && nt != null && state.positions.length > 0 && nt >= normalizeProfit()){
-    log(`🎯 NORM PROFIT — basket +${nt.toFixed(4)}`, 'pos');
-    closeAll(`NORM PROFIT +${nt.toFixed(4)}`); return;
-  }
-
-  if (state.positions.length >= maxOpen) return;
-  if (Date.now() - state.lastEntryAt < ENTRY_COOLDOWN) return;
-
-  const openNet = totalNet(true) ?? 0;
-  if (normEnabled() && state.positions.length > 0 && openNet > -normalizeLoss()) return;
-
-  const openSyms = new Set(state.positions.map(p => normSym(p.sym)));
-  const pool = syms.filter(s => !openSyms.has(normSym(s)));
-  if (!pool.length) return;
-
-  const candidates = [];
-  for (const s of pool){
-    if (!isFresh(s)){ refreshStale([s]); continue; }
-    const sig = signalFor(s);
-    if (!sig) continue;
-    const price = freshFut(s);
-    if (price == null) continue;
-    const g = gapConfirms(s, sig.side);
-    if (gapEnabled() && !g.ok) continue;
-    candidates.push({ sym: s, price, absGap: Math.abs(sig.gap), side: sig.side, gapTicks: g.ticks });
-  }
-  if (!candidates.length) return;
-
-  candidates.sort((a,b) => b.absGap - a.absGap);
-  const pick = candidates[0];
-  const plan = planEntry(pick.sym, openNet);
-  if (!plan) return;
-
-  const qty = plan.notional / pick.price;
-  if (executeOpen(pick.sym, plan.side, qty, 'auto', plan.notional, pick.price, plan.spot)){
-    state.apCycles++;
-    state.lastEntryAt = Date.now();
-    log(`🤖 GAP ${pick.sym}: ${plan.side} $${plan.notional.toFixed(2)} · gap ${pick.gapTicks?.toFixed(1)}t · ${candidates.length} confirmed`, 'pos');
-  }
-}
-
-function checkDrift(){
-  if (!state.positions.length) return;
-  const up = parseFloat(state.settings.driftUp);
-  const dn = parseFloat(state.settings.driftDn);
-  const upT = (isFinite(up) && up > 0) ? up : null;
-  const dnT = (isFinite(dn) && dn > 0) ? dn : null;
-  if (upT == null && dnT == null) return;
-  const nt = totalNet(true);
-  if (nt == null){ refreshStale(state.positions.map(p => p.sym)); return; }
-  if (upT != null && nt >= upT){ log(`⚠ +DRIFT`, 'neg'); closeAll(`+DRIFT ${nt.toFixed(4)}`); }
-  else if (dnT != null && nt <= -dnT){ log(`⚠ −DRIFT`, 'neg'); closeAll(`−DRIFT ${nt.toFixed(4)}`); }
-}
-function checkManualExits(){
-  if (!state.positions.length || state.settings.autopilot) return;
-  const tp = parseFloat(state.settings.tp);
-  const sl = parseFloat(state.settings.sl);
-  const tpAmt = (isFinite(tp) && tp > 0) ? tp : null;
-  const slAmt = (isFinite(sl) && sl > 0) ? sl : null;
-  if (tpAmt == null && slAmt == null) return;
-  [...state.positions].forEach(p => {
-    const cur = freshFut(p.sym);
-    if (cur == null) return;
-    const net = netAt(p, cur);
-    if (tpAmt != null && net >= tpAmt) closePos(p.id, 'TP HIT', cur);
-    else if (slAmt != null && net <= -slAmt) closePos(p.id, 'SL HIT', cur);
-  });
-}
-
-/* ───────── Persistence ───────── */
-function saveState(){
-  try {
-    const toSave = {
-      symbols: state.symbols, checked: state.checked, positions: state.positions,
-      sessionStart: state.sessionStart, realizedPnl: state.realizedPnl,
-      realizedFees: state.realizedFees, tradeCount: state.tradeCount,
-      wins: state.wins, losses: state.losses, posSeq: state.posSeq,
-      settings: state.settings
-    };
-    fs.writeFileSync(STATE_FILE, JSON.stringify(toSave));
-  } catch(e){ console.error('saveState:', e.message); }
-}
-function loadState(){
-  try {
-    if (!fs.existsSync(STATE_FILE)) return;
-    const d = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-    if (Array.isArray(d.symbols) && d.symbols.length) state.symbols = d.symbols;
-    if (Array.isArray(d.checked)) state.checked = d.checked;
-    if (Array.isArray(d.positions)) state.positions = d.positions;
-    if (d.sessionStart) state.sessionStart = d.sessionStart;
-    if (d.realizedPnl  != null) state.realizedPnl  = d.realizedPnl;
-    if (d.realizedFees != null) state.realizedFees = d.realizedFees;
-    if (d.tradeCount   != null) state.tradeCount   = d.tradeCount;
-    if (d.wins   != null) state.wins   = d.wins;
-    if (d.losses != null) state.losses = d.losses;
-    if (d.posSeq != null) state.posSeq = d.posSeq;
-    if (d.settings) Object.assign(state.settings, d.settings);
-    log('♻ State restored from disk', 'pos');
-  } catch(e){ console.error('loadState:', e.message); }
-}
-
-/* ───────── API + UI ───────── */
-const app = express();
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
-
-app.get('/health', (_req, res) => res.json({ ok: true, uptime: process.uptime() }));
-
-app.get('/api/state', (_req, res) => {
-  res.json({
-    symbols: state.symbols, checked: state.checked,
-    spot: state.spot, fut: state.fut, tickAt: state.tickAt,
-    positions: state.positions, queue: state.queue,
-    sessionStart: state.sessionStart, realizedPnl: state.realizedPnl,
-    realizedFees: state.realizedFees, tradeCount: state.tradeCount,
-    wins: state.wins, losses: state.losses, posSeq: state.posSeq,
-    settings: state.settings,
-    logs: state.logs.slice(0, 60),
-    lastTickAt: state.lastTickAt,
-    ws: { spotOpen: state.ws.spotOpen, futOpen: state.ws.futOpen },
-    server: { now: Date.now(), uptime: process.uptime() }
-  });
-});
-
-app.post('/api/settings', (req, res) => {
-  Object.assign(state.settings, req.body || {});
-  saveState();
-  res.json({ ok: true });
-});
-
-app.post('/api/symbols', (req, res) => {
-  const { action, symbol } = req.body || {};
-  const S = normSym(symbol);
-  if (!S) return res.json({ ok: false, error: 'bad symbol' });
-  if (action === 'add'){
-    if (!state.symbols.includes(S)) state.symbols.push(S);
-    if (!state.checked.includes(S)) state.checked.push(S);
-    connectWs(); saveState();
-  } else if (action === 'remove'){
-    if (state.positions.some(p => normSym(p.sym) === S))
-      return res.json({ ok: false, error: 'close positions first' });
-    state.symbols = state.symbols.filter(s => s !== S);
-    state.checked = state.checked.filter(s => s !== S);
-    state.queue = state.queue.filter(q => normSym(q.sym) !== S);
-    connectWs(); saveState();
-  } else if (action === 'toggle'){
-    if (state.checked.includes(S)) state.checked = state.checked.filter(x => x !== S);
-    else if (state.symbols.includes(S)) state.checked.push(S);
-    saveState();
-  }
-  res.json({ ok: true });
-});
-
-app.post('/api/open', async (req, res) => {
-  const { side, symbol } = req.body || {};
-  if (!['LONG','SHORT'].includes(side)) return res.json({ ok: false, error: 'bad side' });
-  const notional = parseFloat(state.settings.amt);
-  if (!isFinite(notional) || notional <= 0) return res.json({ ok: false, error: 'bad amt' });
-  const target = symbol ? [normSym(symbol)] : [...state.checked];
-  let opened = 0; const stale = [];
-  for (const s of target){
-    if (gapEnabled() && !gapConfirms(s, side).ok) continue;
-    const price = freshFut(s);
-    if (price != null){
-      if (executeOpen(s, side, notional / price, 'manual', notional, price, spotPx(s))) opened++;
-    } else stale.push(s);
-  }
-  if (stale.length){
-    await restPriceBatch(stale);
-    for (const s of stale){
-      const price = freshFut(s);
-      if (price != null) { if (executeOpen(s, side, notional/price, 'manual', notional, price, spotPx(s))) opened++; }
-      else if (!state.queue.some(q => normSym(q.sym) === s && q.side === side))
-        state.queue.push({ sym: s, side, notional, at: Date.now() });
-    }
-  }
-  res.json({ ok: true, opened });
-});
-
-app.post('/api/close/:id', (req, res) => {
-  const id = parseInt(req.params.id, 10);
-  res.json({ ok: closePos(id, '✕ manual') });
-});
-
-app.post('/api/exit-all', (_req, res) => {
-  state.queue = [];
-  state.settings.autopilot = false;
-  closeAll('EXIT ALL');
-  saveState();
-  res.json({ ok: true });
-});
-
-app.post('/api/reset-session', (_req, res) => {
-  state.sessionStart = Date.now();
-  state.realizedPnl = 0; state.realizedFees = 0;
-  state.tradeCount = 0; state.wins = 0; state.losses = 0;
-  saveState();
-  res.json({ ok: true });
-});
-
-/* ───────── Main loops ───────── */
-setInterval(() => {
-  try { autopilotTick(); checkManualExits(); checkDrift(); flushQueue(); }
-  catch(e){ console.error('tick:', e.message); }
-}, 1000);
-
-setInterval(async () => {
-  if (state.restBusy) return;
-  state.restBusy = true;
-  try { await Promise.all([restSpotAll(), restFutAll()]); flushQueue(); }
-  finally { state.restBusy = false; }
-}, 5000);
-
-setInterval(() => {
-  if (!state.symbols.length) return;
-  if (Date.now() - state.ws.lastMsg > WS_SILENT){
-    log('Watchdog: reconnecting WS', 'neg');
-    connectWs();
-  }
-}, 10000);
-
-setInterval(saveState, 3000);
-
-/* ───────── Boot ───────── */
-app.listen(PORT, () => {
-  console.log('Delta Neutral server-side engine listening on', PORT);
-  loadState();
-  connectWs();
-  fetchTickSizes();
-  setTimeout(() => Promise.all([restSpotAll(), restFutAll()]), 2000);
-});
+<!DOCTYPE html><html lang="en" class="optimisticai_d4925249-module__WZtcjq__variable optimisticmono_9b82a078-module__hMSRWa__variable light"><head><meta charSet="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><link rel="stylesheet" href="/_next/static/immutable/chunks/0_n83orcwyk4s.css" data-precedence="next"/><link rel="stylesheet" href="/_next/static/immutable/chunks/3_0ynghgv8ysl.css" data-precedence="next"/><link rel="stylesheet" href="/_next/static/immutable/chunks/42e7h9g2vn8e3.css" data-precedence="next"/><link rel="stylesheet" href="/_next/static/immutable/chunks/287l5xq35imjj.css" data-precedence="next"/><link rel="stylesheet" href="/_next/static/immutable/chunks/17oghy4n4g9qf.css" data-precedence="next"/><link rel="preload" as="script" fetchPriority="low" href="/_next/static/immutable/chunks/36baba7il59p9.js"/><script src="/_next/static/immutable/chunks/3wjrws3btpzvw.js" async=""></script><script src="/_next/static/immutable/chunks/2nqiqj-lrk2yk.js" async=""></script><script src="/_next/static/immutable/chunks/turbopack-1k_9_s5ny_7ut.js" async=""></script><script src="/_next/static/immutable/chunks/1dq47j4p-xg3o.js" async=""></script><script src="/_next/static/immutable/chunks/2t-jlsga_9q2d.js" async=""></script><meta name="next-size-adjust" content=""/><script>(function(){try{var d=document.documentElement,m=window.matchMedia("(prefers-color-scheme: dark)");function a(){var c=d.classList;if(m.matches){c.remove("light");c.add("dark");}else{c.remove("dark");c.add("light");}}a();m.addEventListener("change",a);}catch(e){}})()</script><meta name="sentry-trace" content="7182f92332cd483090a6d6d38c3ab22a-b11fc1c6c229c6bc-0"/><meta name="baggage" content="sentry-environment=production,sentry-release=e2a82008b55e614492d7a73681d0e5284b60f380,sentry-public_key=217336c598020d63d1a44137ff8fdb71,sentry-trace_id=7182f92332cd483090a6d6d38c3ab22a,sentry-org_id=4509963614355457,sentry-sampled=false,sentry-sample_rand=0.9913929913567121,sentry-sample_rate=0.1"/><script src="/_next/static/immutable/chunks/0cz1d0mv5g_q7.js" noModule=""></script></head><body><div hidden=""><!--$--><!--/$--></div><div class="min-h-dvh px-6 pt-8 pb-8 font-mono text-[14px] leading-[1.6]"><pre class="mx-auto flex max-w-[1000px] items-start bg-transparent"><div class="text-text-tertiary border-fill-divider me-4 min-w-[40px] shrink-0 border-e pe-4 text-end select-none" aria-hidden="true"><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div><div>6</div><div>7</div><div>8</div><div>9</div><div>10</div><div>11</div><div>12</div><div>13</div><div>14</div><div>15</div><div>16</div><div>17</div><div>18</div><div>19</div><div>20</div><div>21</div><div>22</div><div>23</div><div>24</div><div>25</div><div>26</div><div>27</div><div>28</div><div>29</div><div>30</div><div>31</div><div>32</div><div>33</div><div>34</div><div>35</div><div>36</div><div>37</div><div>38</div><div>39</div><div>40</div><div>41</div><div>42</div><div>43</div><div>44</div><div>45</div><div>46</div><div>47</div><div>48</div><div>49</div><div>50</div><div>51</div><div>52</div><div>53</div><div>54</div><div>55</div><div>56</div><div>57</div><div>58</div><div>59</div><div>60</div><div>61</div><div>62</div><div>63</div><div>64</div><div>65</div><div>66</div><div>67</div><div>68</div><div>69</div><div>70</div><div>71</div><div>72</div><div>73</div><div>74</div><div>75</div><div>76</div><div>77</div><div>78</div><div>79</div><div>80</div><div>81</div><div>82</div><div>83</div><div>84</div><div>85</div><div>86</div><div>87</div><div>88</div><div>89</div><div>90</div><div>91</div><div>92</div><div>93</div><div>94</div><div>95</div><div>96</div><div>97</div><div>98</div><div>99</div><div>100</div><div>101</div><div>102</div><div>103</div><div>104</div><div>105</div><div>106</div><div>107</div><div>108</div><div>109</div><div>110</div><div>111</div><div>112</div><div>113</div><div>114</div><div>115</div><div>116</div><div>117</div><div>118</div><div>119</div><div>120</div><div>121</div><div>122</div><div>123</div><div>124</div><div>125</div></div><code class="block min-w-0 flex-1 overflow-x-auto whitespace-pre"><pre class="shiki shiki-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e" tabindex="0"><code><span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">const</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> express</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> =</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0"> require</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'express'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">const</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> cors</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> =</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0"> require</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'cors'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">const</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> path</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> =</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0"> require</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'path'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">const</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> compression</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> =</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0"> require</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'compression'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">const</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> helmet</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> =</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0"> require</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'helmet'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">const</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> morgan</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> =</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0"> require</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'morgan'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">const</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> app</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> =</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0"> express</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">();</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">const</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> PORT</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> =</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> process.env.</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">PORT</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> ||</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> 3000</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">;</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">const</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> START_TIME</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> =</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> Date.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">now</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">();</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">// Middleware</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">app.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">use</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">compression</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">());</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">app.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">use</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">helmet</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">({</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  contentSecurityPolicy: </span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">false</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">// allow binance ws and inline scripts from your HTML</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  crossOriginEmbedderPolicy: </span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">false</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">}));</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">app.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">use</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">cors</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">());</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">app.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">use</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">morgan</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'tiny'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">));</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">app.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">use</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(express.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">json</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">());</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">// No-cache for dynamic routes</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">app.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">use</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">((</span><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">req</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">res</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">next</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">) </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">=></span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> {</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">  if</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> (req.path.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">startsWith</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'/health'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">) </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">||</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> req.path.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">startsWith</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'/ping'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">) </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">||</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> req.path.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">startsWith</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'/api'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">)) {</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">    res.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">set</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'Cache-Control'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'no-store, no-cache, must-revalidate, proxy-revalidate'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  }</span></span>
+<span class="line"><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">  next</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">();</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">});</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">// --- 24/7 KEEP ALIVE ROUTES FOR UPTIMEROBOT ---</span></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">// UptimeRobot should ping /ping every 5 minutes</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">app.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">get</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'/ping'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, (</span><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">req</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">res</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">) </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">=></span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> {</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  res.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">status</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">200</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">).</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">send</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'pong'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">});</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">app.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">get</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'/health'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, (</span><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">req</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">res</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">) </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">=></span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> {</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">  const</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> uptimeSeconds</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> =</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> Math.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">floor</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">((Date.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">now</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">() </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">-</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> START_TIME</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">) </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">/</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> 1000</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">  const</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> uptimeHuman</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> =</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> `${</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">Math</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">floor</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">(</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">uptimeSeconds</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">/</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">3600</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">)</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">}h ${</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">Math</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">floor</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">((</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">uptimeSeconds</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">%</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">3600</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">)</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">/</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">60</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">)</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">}m ${</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">uptimeSeconds</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">%</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">60</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">}s`</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">;</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  res.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">json</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">({</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">    status: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'online'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">    uptime_seconds: uptimeSeconds,</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">    uptime_human: uptimeHuman,</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">    timestamp: </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">new</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0"> Date</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">().</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">toISOString</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(),</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">    memory: process.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">memoryUsage</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(),</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">    service: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'delta-neutral-simulator'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">    message: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'Server is running 24/7 on Render.com'</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  });</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">});</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">app.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">get</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'/api/status'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, (</span><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">req</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">res</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">) </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">=></span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> {</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  res.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">json</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">({</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">    online: </span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">true</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">    serverTime: </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">new</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0"> Date</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">().</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">toISOString</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(),</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">    binanceSpotWs: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'wss://stream.binance.com:9443/ws'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">    binanceFutWs: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'wss://fstream.binance.com/ws'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">    tip: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'Frontend connects directly to Binance from browser'</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  });</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">});</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">// Serve static files - support both /public and root</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">app.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">use</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(express.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">static</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(path.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">join</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(__dirname, </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'public'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">), { maxAge: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'1h'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> }));</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">app.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">use</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(express.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">static</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(__dirname, { </span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  maxAge: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'1h'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  index: </span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">false</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D"> // we handle index manually</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">}));</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">// Root route</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">app.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">get</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'/'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, (</span><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">req</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">res</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">) </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">=></span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> {</span></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">  // try public/index.html first, then root index.html</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">  const</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> publicIndex</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> =</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> path.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">join</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(__dirname, </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'public'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'index.html'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">  const</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> rootIndex</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> =</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> path.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">join</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(__dirname, </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'index.html'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">  const</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> fs</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> =</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0"> require</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'fs'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">  if</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> (fs.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">existsSync</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(publicIndex)) {</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">    res.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">sendFile</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(publicIndex);</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  } </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">else</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> if</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> (fs.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">existsSync</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(rootIndex)) {</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">    res.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">sendFile</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(rootIndex);</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  } </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">else</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> {</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">    res.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">status</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">404</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">).</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">send</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'index.html not found'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  }</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">});</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">// Catch all - SPA fallback</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">app.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">get</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'*'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, (</span><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">req</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">res</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">) </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">=></span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> {</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">  const</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> publicIndex</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> =</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> path.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">join</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(__dirname, </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'public'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'index.html'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">  const</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> rootIndex</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> =</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> path.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">join</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(__dirname, </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'index.html'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">  const</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> fs</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> =</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0"> require</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'fs'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">  if</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> (fs.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">existsSync</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(publicIndex)) {</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">    res.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">sendFile</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(publicIndex);</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  } </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">else</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> if</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> (fs.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">existsSync</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(rootIndex)) {</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">    res.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">sendFile</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(rootIndex);</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  } </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">else</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> {</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">    res.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">status</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">404</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">).</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">json</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">({ error: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'Not found'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> });</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  }</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">});</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">// Error handler</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">app.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">use</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">((</span><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">err</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">req</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">res</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">next</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">) </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">=></span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> {</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  console.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">error</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'Server error:'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, err);</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  res.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">status</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">500</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">).</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">json</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">({ error: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'Internal server error'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> });</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">});</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">// Start server</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">const</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> server</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> =</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> app.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">listen</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">PORT</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'0.0.0.0'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, () </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">=></span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> {</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  console.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">log</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">`</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">\n</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">🚀 Delta Neutral Server running on port ${</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">PORT</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">}`</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  console.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">log</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">`📊 Health: http://localhost:${</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">PORT</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">}/health`</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  console.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">log</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">`🏓 Ping: http://localhost:${</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">PORT</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">}/ping`</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  console.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">log</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">`🌐 App: http://localhost:${</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">PORT</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">}/`</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  console.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">log</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">`⏰ Started: ${</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">new</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0"> Date</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">().</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">toISOString</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">()</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">}</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">\n</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">`</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">});</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">// Keep alive log every 5 minutes - helps see Render logs</span></span>
+<span class="line"><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">setInterval</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(() </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">=></span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> {</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">  const</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> up</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> =</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> Math.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">floor</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">((Date.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">now</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">() </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">-</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> START_TIME</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">)</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">/</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">1000</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  console.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">log</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">`[keep-alive] uptime ${</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">up</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">}s - ${</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">new</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0"> Date</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">().</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">toISOString</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">()</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">} - memory ${</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">Math</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">round</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">(</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">process</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">memoryUsage</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">().</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">heapUsed</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">/</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">1024</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">/</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">1024</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">)</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">}MB`</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">}, </span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">5</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> *</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> 60</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> *</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> 1000</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">// Graceful shutdown</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">process.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">on</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'SIGTERM'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, () </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">=></span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> {</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  console.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">log</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'SIGTERM received, shutting down...'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  server.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">close</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(() </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">=></span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> {</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">    console.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">log</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'Server closed'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">    process.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">exit</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">0</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  });</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">});</span></span>
+<span class="line"></span></code></pre></code></pre></div><!--$--><!--/$--><script src="/_next/static/immutable/chunks/36baba7il59p9.js" id="_R_" async=""></script><script>(self.__next_f=self.__next_f||[]).push([0])</script><script>self.__next_f.push([1,"1:\"$Sreact.fragment\"\n3:I[498022,[\"/_next/static/immutable/chunks/1dq47j4p-xg3o.js\"],\"default\"]\n4:I[410469,[\"/_next/static/immutable/chunks/1dq47j4p-xg3o.js\"],\"default\"]\n6:I[430098,[\"/_next/static/immutable/chunks/1dq47j4p-xg3o.js\"],\"OutletBoundary\"]\n7:\"$Sreact.suspense\"\na:I[430098,[\"/_next/static/immutable/chunks/1dq47j4p-xg3o.js\"],\"ViewportBoundary\"]\nc:I[430098,[\"/_next/static/immutable/chunks/1dq47j4p-xg3o.js\"],\"MetadataBoundary\"]\ne:I[161360,[\"/_next/static/immutable/chunks/1dq47j4p-xg3o.js\"],\"default\",1]\n:HL[\"/_next/static/immutable/chunks/0_n83orcwyk4s.css\",\"style\"]\n:HL[\"/_next/static/immutable/chunks/3_0ynghgv8ysl.css\",\"style\"]\n:HL[\"/_next/static/immutable/media/OptimisticAI_VF_Optimized-s.p.41te7jvyx2g5b.woff2\",\"font\",{\"crossOrigin\":\"\",\"type\":\"font/woff2\"}]\n:HL[\"/_next/static/immutable/media/OptimisticAI_W_TextRegularIt-s.p.3i-4g1i3oysuq.woff2\",\"font\",{\"crossOrigin\":\"\",\"type\":\"font/woff2\"}]\n:HL[\"/_next/static/immutable/chunks/42e7h9g2vn8e3.css\",\"style\"]\n:HL[\"/_next/static/immutable/chunks/287l5xq35imjj.css\",\"style\"]\n:HL[\"/_next/static/immutable/chunks/17oghy4n4g9qf.css\",\"style\"]\n9:X\n0:{\"P\":null,\"c\":[\"\",\"document?artifact_uuid=bd5c2c6d-41cb-4ca1-bd2a-64cb66f87193\u0026ext=1790900557\u0026hash=Q5fpDAFBSE5wkX-TONiRLr15YPKT\"],\"q\":\"?artifact_uuid=bd5c2c6d-41cb-4ca1-bd2a-64cb66f87193\u0026ext=1790900557\u0026hash=Q5fpDAFBSE5wkX-TONiRLr15YPKT\",\"i\":false,\"f\":[[[\"\",{\"children\":[\"document\",{\"children\":[\"__PAGE__?{\\\"artifact_uuid\\\":\\\"bd5c2c6d-41cb-4ca1-bd2a-64cb66f87193\\\",\\\"ext\\\":\\\"1790900557\\\",\\\"hash\\\":\\\"Q5fpDAFBSE5wkX-TONiRLr15YPKT\\\"}\",{},\"$undefined\",\"$undefined\",4096]},\"$undefined\",\"$undefined\",4096]},\"$undefined\",\"$undefined\",4112],[[\"$\",\"$1\",\"c\",{\"children\":[[[\"$\",\"link\",\"0\",{\"rel\":\"stylesheet\",\"href\":\"/_next/static/immutable/chunks/0_n83orcwyk4s.css\",\"precedence\":\"next\",\"crossOrigin\":\"$undefined\",\"nonce\":\"$undefined\"}],[\"$\",\"link\",\"1\",{\"rel\":\"stylesheet\",\"href\":\"/_next/static/immutable/chunks/3_0ynghgv8ysl.css\",\"precedence\":\"next\",\"crossOrigin\":\"$undefined\",\"nonce\":\"$undefined\"}],[\"$\",\"script\",\"script-0\",{\"src\":\"/_next/static/immutable/chunks/1dq47j4p-xg3o.js\",\"async\":true,\"nonce\":\"$undefined\"}]],\"$L2\"]}],{\"children\":[[\"$\",\"$1\",\"c\",{\"children\":[null,[\"$\",\"$L3\",null,{\"parallelRouterKey\":\"children\",\"error\":\"$undefined\",\"errorStyles\":\"$undefined\",\"errorScripts\":\"$undefined\",\"template\":[\"$\",\"$L4\",null,{}],\"templateStyles\":\"$undefined\",\"templateScripts\":\"$undefined\",\"notFound\":\"$undefined\",\"forbidden\":\"$undefined\",\"unauthorized\":\"$undefined\"}]]}],{\"children\":[[\"$\",\"$1\",\"c\",{\"children\":[\"$L5\",[[\"$\",\"link\",\"0\",{\"rel\":\"stylesheet\",\"href\":\"/_next/static/immutable/chunks/42e7h9g2vn8e3.css\",\"precedence\":\"next\",\"crossOrigin\":\"$undefined\",\"nonce\":\"$undefined\"}],[\"$\",\"link\",\"1\",{\"rel\":\"stylesheet\",\"href\":\"/_next/static/immutable/chunks/287l5xq35imjj.css\",\"precedence\":\"next\",\"crossOrigin\":\"$undefined\",\"nonce\":\"$undefined\"}],[\"$\",\"link\",\"2\",{\"rel\":\"stylesheet\",\"href\":\"/_next/static/immutable/chunks/17oghy4n4g9qf.css\",\"precedence\":\"next\",\"crossOrigin\":\"$undefined\",\"nonce\":\"$undefined\"}],[\"$\",\"script\",\"script-0\",{\"src\":\"/_next/static/immutable/chunks/2t-jlsga_9q2d.js\",\"async\":true,\"nonce\":\"$undefined\"}]],[\"$\",\"$L6\",null,{\"children\":[\"$\",\"$7\",null,{\"name\":\"Next.MetadataOutlet\",\"children\":\"$@8\"}]}]]}],{},null,false,null]},null,false,\"$9\"]},null,false,null],[\"$\",\"$1\",\"h\",{\"children\":[null,[\"$\",\"$La\",null,{\"children\":\"$Lb\"}],[\"$\",\"div\",null,{\"hidden\":true,\"children\":[\"$\",\"$Lc\",null,{\"children\":[\"$\",\"$7\",null,{\"name\":\"Next.Metadata\",\"children\":\"$Ld\"}]}]}],[\"$\",\"meta\",null,{\"name\":\"next-size-adjust\",\"content\":\"\"}]]}],false]],\"m\":\"$undefined\",\"G\":[\"$e\",[[\"$\",\"link\",\"0\",{\"rel\":\"stylesheet\",\"href\":\"/_next/static/immutable/chunks/0_n83orcwyk4s.css\",\"precedence\":\"next\",\"crossOrigin\":\"$undefined\",\"nonce\":\"$undefined\"}],[\"$\",\"link\",\"1\",{\"rel\":\"stylesheet\",\"href\":\"/_next/static/immutable/chunks/3_0ynghgv8ysl.css\",\"precedence\":\"next\",\"crossOrigin\":\"$undefined\",\"nonce\":\"$undefined\"}]]],\"S\":false,\"h\":null,\"r\":\"$undefined\",\"s\":\"$undefined\",\"a\":\"$undefined\",\"l\":\"$undefined\",\"p\":\"$undefined\",\"d\":\"$undefined\",\"b\":\"xKWuz48iLBEfIHdyty2o5\"}\n9:C\n2:[\"$\",\"html\",null,{\"lang\":\"en\",\"className\":\"optimisticai_d4925249-module__WZtcjq__variable optimisticmono_9b82a078-module__hMSRWa__variable light\",\"children\":[[\"$\",\"head\",null,{\"children\":[\"$\",\"script\",null,{\"suppressHydrationWarning\":true,\"dangerouslySetInnerHTML\":{\"__html\":\"(function(){try{var d=document.documentElement,m=window.matchMedia(\\\"(prefers-color-scheme: dark)\\\");function a(){var c=d.classList;if(m.matches){c.remove(\\\"light\\\");c.add(\\\"dark\\\");}else{c.remove(\\\"dark\\\");c.add(\\\"light\\\");}}a();m.addEventListener(\\\"change\\\",a);}catch(e){}})()\"}}]}],[\"$\",\"body\",null,{\"children\":[\"$\",\"$L3\",null,{\"parallelRouterKey\":\"children\",\"error\":\"$undefined\",\"errorStyles\":\"$undefined\",\"errorScripts\":\"$undefined\",\"template\":[\"$\",\"$L4\",null,{}],\"templateStyles\":\"$undefined\",\"templateScripts\":\"$undefined\",\"notFound\":[null,[]],\"forbidden\":\"$undefined\",\"unauthorized\":\"$undefined\"}]}]]}]\nb:[[\"$\",\"meta\",\"0\",{\"charSet\":\"utf-8\"}],[\"$\",\"meta\",\"1\",{\"name\":\"viewport\",\"content\":\"width=device-width, initial-scale=1\"}]]\n8:null\nd:[]\nf:I[247881,[\"/_next/static/immutable/chunks/1dq47j4p-xg3o.js\",\"/_next/static/immutable/chunks/2t-jlsga_9q2d.js\"],\"TextViewer\"]\n10:Tb2f7,\u003cpre class=\"shiki shiki-themes github-light github-dark\" style=\"--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e\" tabindex=\"0\"\u003e\u003ccode\u003e\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003econst\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e express\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e =\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003e require\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'express'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003econst\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e cors\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e =\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003e require\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'cors'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003econst\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e path\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e =\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003e require\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'path'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003econst\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e compression\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e =\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003e require\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'compression'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003econst\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e helmet\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e =\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003e require\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'helmet'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003econst\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e morgan\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e =\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003e require\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'morgan'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003econst\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e app\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e =\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003e express\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e();\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003econst\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e PORT\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e =\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e process.env.\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003ePORT\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e ||\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e 3000\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e;\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003econst\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e START_TIME\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e =\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e Date.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003enow\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e();\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#6A737D;--shiki-dark:#6A737D\"\u003e// Middleware\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003eapp.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003euse\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003ecompression\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e());\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003eapp.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003euse\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003ehelmet\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e({\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  contentSecurityPolicy: \u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003efalse\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e, \u003c/span\u003e\u003cspan style=\"--shiki-light:#6A737D;--shiki-dark:#6A737D\"\u003e// allow binance ws and inline scripts from your HTML\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  crossOriginEmbedderPolicy: \u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003efalse\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e}));\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003eapp.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003euse\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003ecors\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e());\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003eapp.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003euse\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003emorgan\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'tiny'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e));\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003eapp.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003euse\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(express.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003ejson\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e());\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#6A737D;--shiki-dark:#6A737D\"\u003e// No-cache for dynamic routes\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003eapp.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003euse\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e((\u003c/span\u003e\u003cspan style=\"--shiki-light:#E36209;--shiki-dark:#FFAB70\"\u003ereq\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e, \u003c/span\u003e\u003cspan style=\"--shiki-light:#E36209;--shiki-dark:#FFAB70\"\u003eres\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e, \u003c/span\u003e\u003cspan style=\"--shiki-light:#E36209;--shiki-dark:#FFAB70\"\u003enext\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e) \u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e=\u003e\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e {\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e  if\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e (req.path.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003estartsWith\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'/health'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e) \u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e||\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e req.path.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003estartsWith\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'/ping'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e) \u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e||\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e req.path.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003estartsWith\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'/api'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e)) {\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e    res.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003eset\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'Cache-Control'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e, \u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'no-store, no-cache, must-revalidate, proxy-revalidate'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  }\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003e  next\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e();\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e});\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#6A737D;--shiki-dark:#6A737D\"\u003e// --- 24/7 KEEP ALIVE ROUTES FOR UPTIMEROBOT ---\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#6A737D;--shiki-dark:#6A737D\"\u003e// UptimeRobot should ping /ping every 5 minutes\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003eapp.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003eget\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'/ping'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e, (\u003c/span\u003e\u003cspan style=\"--shiki-light:#E36209;--shiki-dark:#FFAB70\"\u003ereq\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e, \u003c/span\u003e\u003cspan style=\"--shiki-light:#E36209;--shiki-dark:#FFAB70\"\u003eres\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e) \u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e=\u003e\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e {\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  res.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003estatus\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e200\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e).\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003esend\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'pong'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e});\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003eapp.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003eget\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'/health'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e, (\u003c/span\u003e\u003cspan style=\"--shiki-light:#E36209;--shiki-dark:#FFAB70\"\u003ereq\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e, \u003c/span\u003e\u003cspan style=\"--shiki-light:#E36209;--shiki-dark:#FFAB70\"\u003eres\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e) \u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e=\u003e\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e {\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e  const\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e uptimeSeconds\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e =\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e Math.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003efloor\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e((Date.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003enow\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e() \u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e-\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e START_TIME\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e) \u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e/\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e 1000\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e  const\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e uptimeHuman\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e =\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e `${\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003eMath\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003efloor\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003euptimeSeconds\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e/\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e3600\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e)\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e}h ${\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003eMath\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003efloor\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e((\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003euptimeSeconds\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e%\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e3600\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e)\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e/\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e60\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e)\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e}m ${\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003euptimeSeconds\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e%\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e60\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e}s`\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e;\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  res.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003ejson\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e({\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e    status: \u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'online'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e,\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e    uptime_seconds: uptimeSeconds,\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e    uptime_human: uptimeHuman,\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e    timestamp: \u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003enew\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003e Date\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e().\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003etoISOString\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(),\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e    memory: process.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003ememoryUsage\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(),\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e    service: \u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'delta-neutral-simulator'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e,\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e    message: \u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'Server is running 24/7 on Render.com'\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  });\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e});\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003eapp.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003eget\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'/api/status'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e, (\u003c/span\u003e\u003cspan style=\"--shiki-light:#E36209;--shiki-dark:#FFAB70\"\u003ereq\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e, \u003c/span\u003e\u003cspan style=\"--shiki-light:#E36209;--shiki-dark:#FFAB70\"\u003eres\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e) \u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e=\u003e\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e {\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  res.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003ejson\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e({\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e    online: \u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003etrue\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e,\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e    serverTime: \u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003enew\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003e Date\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e().\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003etoISOString\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(),\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e    binanceSpotWs: \u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'wss://stream.binance.com:9443/ws'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e,\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e    binanceFutWs: \u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'wss://fstream.binance.com/ws'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e,\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e    tip: \u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'Frontend connects directly to Binance from browser'\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  });\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e});\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#6A737D;--shiki-dark:#6A737D\"\u003e// Serve static files - support both /public and root\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003eapp.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003euse\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(express.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003estatic\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(path.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003ejoin\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(__dirname, \u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'public'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e), { maxAge: \u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'1h'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e }));\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003eapp.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003euse\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(express.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003estatic\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(__dirname, { \u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  maxAge: \u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'1h'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e,\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  index: \u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003efalse\u003c/span\u003e\u003cspan style=\"--shiki-light:#6A737D;--shiki-dark:#6A737D\"\u003e // we handle index manually\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e}));\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#6A737D;--shiki-dark:#6A737D\"\u003e// Root route\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003eapp.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003eget\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'/'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e, (\u003c/span\u003e\u003cspan style=\"--shiki-light:#E36209;--shiki-dark:#FFAB70\"\u003ereq\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e, \u003c/span\u003e\u003cspan style=\"--shiki-light:#E36209;--shiki-dark:#FFAB70\"\u003eres\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e) \u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e=\u003e\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e {\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#6A737D;--shiki-dark:#6A737D\"\u003e  // try public/index.html first, then root index.html\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e  const\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e publicIndex\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e =\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e path.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003ejoin\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(__dirname, \u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'public'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e, \u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'index.html'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e  const\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e rootIndex\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e =\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e path.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003ejoin\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(__dirname, \u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'index.html'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e  const\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e fs\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e =\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003e require\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'fs'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e  if\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e (fs.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003eexistsSync\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(publicIndex)) {\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e    res.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003esendFile\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(publicIndex);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  } \u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003eelse\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e if\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e (fs.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003eexistsSync\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(rootIndex)) {\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e    res.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003esendFile\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(rootIndex);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  } \u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003eelse\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e {\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e    res.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003estatus\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e404\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e).\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003esend\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'index.html not found'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  }\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e});\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#6A737D;--shiki-dark:#6A737D\"\u003e// Catch all - SPA fallback\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003eapp.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003eget\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'*'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e, (\u003c/span\u003e\u003cspan style=\"--shiki-light:#E36209;--shiki-dark:#FFAB70\"\u003ereq\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e, \u003c/span\u003e\u003cspan style=\"--shiki-light:#E36209;--shiki-dark:#FFAB70\"\u003eres\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e) \u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e=\u003e\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e {\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e  const\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e publicIndex\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e =\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e path.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003ejoin\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(__dirname, \u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'public'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e, \u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'index.html'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e  const\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e rootIndex\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e =\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e path.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003ejoin\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(__dirname, \u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'index.html'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e  const\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e fs\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e =\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003e require\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'fs'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e  if\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e (fs.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003eexistsSync\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(publicIndex)) {\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e    res.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003esendFile\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(publicIndex);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  } \u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003eelse\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e if\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e (fs.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003eexistsSync\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(rootIndex)) {\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e    res.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003esendFile\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(rootIndex);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  } \u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003eelse\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e {\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e    res.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003estatus\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e404\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e).\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003ejson\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e({ error: \u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'Not found'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e });\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  }\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e});\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#6A737D;--shiki-dark:#6A737D\"\u003e// Error handler\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003eapp.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003euse\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e((\u003c/span\u003e\u003cspan style=\"--shiki-light:#E36209;--shiki-dark:#FFAB70\"\u003eerr\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e, \u003c/span\u003e\u003cspan style=\"--shiki-light:#E36209;--shiki-dark:#FFAB70\"\u003ereq\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e, \u003c/span\u003e\u003cspan style=\"--shiki-light:#E36209;--shiki-dark:#FFAB70\"\u003eres\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e, \u003c/span\u003e\u003cspan style=\"--shiki-light:#E36209;--shiki-dark:#FFAB70\"\u003enext\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e) \u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e=\u003e\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e {\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  console.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003eerror\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'Server error:'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e, err);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  res.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003estatus\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e500\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e).\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003ejson\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e({ error: \u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'Internal server error'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e });\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e});\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#6A737D;--shiki-dark:#6A737D\"\u003e// Start server\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003econst\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e server\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e =\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e app.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003elisten\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003ePORT\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e, \u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'0.0.0.0'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e, () \u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e=\u003e\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e {\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  console.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003elog\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e`\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e\\n\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e🚀 Delta Neutral Server running on port ${\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003ePORT\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e}`\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  console.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003elog\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e`📊 Health: http://localhost:${\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003ePORT\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e}/health`\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  console.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003elog\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e`🏓 Ping: http://localhost:${\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003ePORT\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e}/ping`\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  console.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003elog\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e`🌐 App: http://localhost:${\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003ePORT\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e}/`\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  console.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003elog\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e`⏰ Started: ${\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003enew\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003e Date\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e().\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003etoISOString\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e()\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e}\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e\\n\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e`\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e});\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#6A737D;--shiki-dark:#6A737D\"\u003e// Keep alive log every 5 minutes - helps see Render logs\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003esetInterval\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(() \u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e=\u003e\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e {\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e  const\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e up\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e =\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e Math.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003efloor\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e((Date.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003enow\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e() \u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e-\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e START_TIME\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e)\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e/\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e1000\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  console.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003elog\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e`[keep-alive] uptime ${\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003eup\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e}s - ${\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003enew\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003e Date\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e().\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003etoISOString\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e()\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e} - memory ${\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003eMath\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003eround\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003eprocess\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003ememoryUsage\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e().\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003eheapUsed\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e/\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e1024\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e/\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e1024\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e)\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e}MB`\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e}, \u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e5\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e *\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e 60\u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e *\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e 1000\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#6A737D;--shiki-dark:#6A737D\"\u003e// Graceful shutdown\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003eprocess.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003eon\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'SIGTERM'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e, () \u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e=\u003e\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e {\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  console.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003elog\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'SIGTERM received, shutting down...'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  server.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003eclose\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(() \u003c/span\u003e\u003cspan style=\"--shiki-light:#D73A49;--shiki-dark:#F97583\"\u003e=\u003e\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e {\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e    console.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003elog\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#032F62;--shiki-dark:#9ECBFF\"\u003e'Server closed'\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e    process.\u003c/span\u003e\u003cspan style=\"--shiki-light:#6F42C1;--shiki-dark:#B392F0\"\u003eexit\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e(\u003c/span\u003e\u003cspan style=\"--shiki-light:#005CC5;--shiki-dark:#79B8FF\"\u003e0\u003c/span\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e);\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e  });\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003cspan style=\"--shiki-light:#24292E;--shiki-dark:#E1E4E8\"\u003e});\u003c/span\u003e\u003c/span\u003e\n\u003cspan class=\"line\"\u003e\u003c/span\u003e\u003c/code\u003e\u003c/pre\u003e5:[\"$\",\"$Lf\",null,{\"html\":\"$10\",\"lineCount\":125,\"thumbnailZoom\":null}]\n"])</script></body></html>
