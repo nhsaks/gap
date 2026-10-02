@@ -59,4 +59,16 @@ tr.pend td{opacity:.82; font-style:italic;}
 .sub{font-size:10px; color:var(--muted); display:block; font-weight:400;}
 .session .big{font-size:32px; font-weight:700; margin-top:6px; font-variant-numeric:tabular-nums; letter-spacing:.5px; line-height:1.1;}
 .session .subbig{font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:1px;}
-.apbar{
+.apbar{display:flex; gap:16px; flex-wrap:wrap; align-items:center; background:var(--panel2); border:1px solid var(--border); border-radius:6px; padding:8px 10px; font-size:13px; margin-bottom:10px;}
+.apbar .lbl{color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.5px;}
+.apbar b{font-variant-numeric:tabular-nums;}
+.pill{display:inline-block; padding:2px 9px; border-radius:20px; font-size:11px; font-weight:700;}
+.pill.off{background:rgba(139,149,165,.15); color:var(--muted);}
+.pill.on{background:rgba(46,189,133,.18); color:var(--green); box-shadow:0 0 10px rgba(46,189,133,.25);}
+.pill.gap-on{background:rgba(76,111,255,.18); color:var(--accent); box-shadow:0 0 10px rgba(76,111,255,.20);}
+@media (max-width:560px){
+  body{padding:8px;}
+  .btn{flex:1; padding:10px 8px;}
+  th, td { padding: 4px 4px; font-size: 11px; }
+  .badge { padding: 1px 4px; font-size: 10px; }
+}
