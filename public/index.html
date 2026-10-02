@@ -1,112 +1,129 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Delta Neutral Simulator</title>
-    <link rel="stylesheet" href="style.css">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Delta Neutral Simulator · Spot/Futures Gap</title>
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
-    <div class="app-container">
-        <header>
-            <h1>Delta Neutral <span>Simulator</span></h1>
-            <p class="subtitle">Spot / Futures Gap</p>
-        </header>
 
-        <!-- 1. SESSION - REALIZED PNL -->
-        <div class="card">
-            <h2>SESSION · REALIZED PNL</h2>
-            <div class="stats-grid">
-                <div>Started: <span id="startTime">--:--:--</span></div>
-                <div>Duration: <span id="duration">00:00:00</span></div>
-                <div>Trades: <span id="trades">0</span></div>
-                <div>W / L: <span id="wl">0 / 0</span></div>
-                <div>Fees paid: <span id="fees">0</span></div>
-                <button id="resetBtn">↻ Reset Session</button>
-            </div>
-            <div class="total-pnl">
-                TOTAL REALIZED PNL (SINCE START)
-                <div id="pnl" class="pnl-value">+0.0000</div>
-            </div>
-        </div>
+<h1><span class="dn">Delta Neutral</span> Simulator <span style="font-size:11px;color:var(--muted);font-weight:400;">Spot / Futures Gap</span></h1>
 
-        <!-- 2. SETTINGS - SYMBOLS -->
-        <div class="card">
-            <h2>SETTINGS — SYMBOLS (<span id="symbolCount">0</span>/<span id="totalSymbols">0</span> CHECKED)</h2>
-            <div id="symbolsList" class="symbols-grid">
-                <!-- Injected by JS -->
-            </div>
-            <div class="add-symbol">
-                <input type="text" id="newSymbol" placeholder="Add symbol (e.g. SOL)">
-                <button id="addSymbolBtn">+ Add</button>
-            </div>
-            <p class="info">💡 Only checked symbols are candidates. Autopilot opens them one at a time, only when they qualify — never all at once.</p>
-        </div>
+<div class="card session">
+  <h2>Session · Realized PnL</h2>
+  <div class="stats" style="margin-bottom:6px;">
+    <span>Started: <b id="sessStart">—</b></span>
+    <span>Duration: <b id="sessDur">00:00:00</b></span>
+    <span>Trades: <b id="sessTrades">0</b></span>
+    <span>W / L: <b id="sessWL">0 / 0</b></span>
+    <span>Fees paid: <b id="sessFees">0</b></span>
+    <button class="btn ghost" id="btnReset" style="margin-left:auto; padding:5px 10px; font-size:12px;">⟲ Reset Session</button>
+  </div>
+  <div class="subbig">Total Realized PnL (since start)</div>
+  <div class="big" id="sessRealized">+0.0000</div>
+</div>
 
-        <!-- 3. TRADE SETUP -->
-        <div class="card">
-            <h2>TRADE SETUP</h2>
-            <div class="toggle-row">
-                <label class="switch">
-                    <input type="checkbox" id="autopilotToggle">
-                    <span class="slider"></span>
-                </label>
-                <strong>Autopilot ON</strong>
-            </div>
-            
-            <div class="toggle-row">
-                <label class="switch">
-                    <input type="checkbox" id="gapFilterToggle" checked>
-                    <span class="slider"></span>
-                </label>
-                <strong>Gap Filter ON</strong>
-            </div>
+<div class="card">
+  <h2>Settings — Symbols <span style="color:var(--muted); font-weight:400; font-size:11px;" id="symCount"></span></h2>
+  <div class="row" id="symRow"></div>
+  <div class="row" style="margin-top:8px;">
+    <div class="fld" style="flex:2; min-width:120px;"><input type="text" id="newSym" placeholder="Add symbol (e.g. SOL)"></div>
+    <button class="btn ghost" id="addSym" style="flex:0 0 auto;">＋ Add</button>
+  </div>
+  <div class="hint">💡 Only <b>checked</b> symbols are candidates. Autopilot opens them <b>one at a time, only when they qualify</b> — never all at once.</div>
+</div>
 
-            <div class="gap-inputs">
-                <div>
-                    <label>Long gap (↑ ticks → SHORT)</label>
-                    <input type="number" id="longGap" value="10">
-                </div>
-                <div>
-                    <label>Short gap (↓ ticks → LONG)</label>
-                    <input type="number" id="shortGap" value="10">
-                </div>
-            </div>
-            
-            <p class="info">index price = spot · premium price = futures. Futures above spot by ≥ long gap ticks → SHORT. Futures below spot by ≥ short gap ticks → LONG.</p>
-        </div>
+<div class="card">
+  <h2>Trade Setup</h2>
 
-        <!-- 4. POSITIONS TABLE -->
-        <div class="card">
-            <h2>OPEN POSITIONS</h2>
-            <div class="table-wrapper">
-                <table id="positionsTable">
-                    <thead>
-                        <tr>
-                            <th>Time</th>
-                            <th>Symbol</th>
-                            <th>Side</th>
-                            <th>Entry</th>
-                            <th>Current</th>
-                            <th>PnL</th>
-                        </tr>
-                    </thead>
-                    <tbody id="positionsTableBody">
-                        <tr><td colspan="6" class="no-data">No active positions</td></tr>
-                    </tbody>
-                </table>
-            </div>
-        </div>
+  <div class="row" style="margin-bottom:8px;">
+    <label class="symbox" style="padding:7px 10px;">
+      <input type="checkbox" id="autopilot"> <b>Autopilot ON</b>
+    </label>
+    <span class="hint" style="margin:0; flex:1; min-width:160px;">
+      Scans checked coins · enters <b>one leg per tick</b> on the coin <b>farthest from index price</b> · exits each leg at <b>+$0.05</b> · basket SL closes all.
+    </span>
+  </div>
 
-        <!-- 5. LOGS -->
-        <div class="card">
-            <h2>SYSTEM LOGS</h2>
-            <div id="logsContainer" class="logs-container">
-                <div class="no-data">No logs yet</div>
-            </div>
-        </div>
+  <div class="row" style="margin-bottom:8px; padding:8px 10px; background:rgba(76,111,255,.06); border:1px solid rgba(76,111,255,.25); border-radius:8px;">
+    <label class="symbox" style="padding:5px 9px; background:transparent; border:none;">
+      <input type="checkbox" id="gapFilter" checked> <b style="color:var(--accent)">Gap Filter ON</b>
+    </label>
+    <div class="fld xs" style="flex:0 0 130px;"><label class="fl">Long gap (↑ ticks → SHORT)</label><input type="number" id="longGap" value="10" step="1" min="1"></div>
+    <div class="fld xs" style="flex:0 0 130px;"><label class="fl">Short gap (↓ ticks → LONG)</label><input type="number" id="shortGap" value="10" step="1" min="1"></div>
+    <span class="hint" style="margin:0; flex:1; min-width:180px; color:var(--muted);">
+      <b>index price</b> = spot · <b>premium price</b> = futures. Futures above spot by ≥ long gap ticks → <b>SHORT</b>. Futures below spot by ≥ short gap ticks → <b>LONG</b>.
+    </span>
+  </div>
 
-    </div>
-    <script src="script.js"></script>
+  <div class="row">
+    <div class="fld xs" style="flex:0 0 90px;"><label class="fl">Max Open</label><input type="number" id="maxOpen" value="5" step="1" min="1" max="50"></div>
+    <div class="fld xs"><label class="fl">SL $</label><input type="number" id="sl" value="0.15" step="0.01" min="0"></div>
+    <div class="fld xs"><label class="fl">USDT Amt</label><input type="number" id="amt" value="10" step="1" min="0"></div>
+    <div class="fld xs"><label class="fl">Fees %</label><input type="number" id="fee" placeholder="blank = 0" step="0.01" min="0"></div>
+  </div>
+
+  <div class="row" style="margin-top:8px;">
+    <button class="btn fetch" id="btnFetch">⚡ Fetch Prices</button>
+    <button class="btn warn" id="btnExit">Exit All</button>
+  </div>
+  <div class="hint" id="gateHint">Step 1: check symbols → Step 2: <b>Fetch Prices</b> → Step 3: enable Autopilot.</div>
+</div>
+
+<div class="card">
+  <div class="stats" style="margin-bottom:8px;">
+    <span><span class="dot" id="connDot"></span><span id="connTxt">Connecting…</span></span>
+    <span>Positions: <b id="nPos">0</b></span>
+    <span>Queued: <b id="nQueue">0</b></span>
+    <span>Gap data: <b id="gapCount">0</b></span>
+    <span>Last tick: <b id="lastTickAge">—</b></span>
+    <span>Auto-exit: <b id="autoTxt"></b></span>
+  </div>
+  <div class="ticker" id="ticker"></div>
+</div>
+
+<div class="card">
+  <h2>Active Positions &amp; Pending Legs</h2>
+
+  <div class="apbar">
+    <span class="lbl">Autopilot</span>
+    <span class="pill off" id="apPill">OFF</span>
+    <span class="pill off" id="gapPill" style="margin-left:-6px;">GAP OFF</span>
+    <span>Active <b id="apActive">0 / 5</b></span>
+    <span>Pending <b id="apWaiting">0</b></span>
+    <span>Ready <b id="apReady">0</b></span>
+    <span>Gap-blocked <b id="apGapBlocked">0</b></span>
+    <span>Open net <b id="apNet">0</b></span>
+    <span style="margin-left:auto; font-size:11px;" id="apNote">—</span>
+  </div>
+
+  <div style="overflow-x:auto;">
+  <table>
+    <thead>
+      <tr>
+        <th>Coin</th><th>Side</th>
+        <th>Entry<span class="sub">futures / index</span></th>
+        <th>Qty</th>
+        <th>Amt<span class="sub">USDT</span></th>
+        <th>PnL<span class="sub">$ / %</span></th>
+        <th>Gap<span class="sub">ticks / %</span></th><th></th>
+      </tr>
+    </thead>
+    <tbody id="tbody"></tbody>
+  </table>
+  </div>
+  <div class="hint" style="margin-top:8px;">
+    <b>PENDING</b> rows sorted by <b>distance from index price</b> (largest gap on top).
+    <b>READY</b> = gap ≥ threshold. <b>GAP BLOCK</b> = gap present but below threshold.
+  </div>
+</div>
+
+<div class="card">
+  <h2>Activity Log</h2>
+  <div id="log"></div>
+</div>
+
+<script src="script.js"></script>
 </body>
 </html>
