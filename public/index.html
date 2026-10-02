@@ -13,7 +13,7 @@
             <p class="subtitle">Spot / Futures Gap</p>
         </header>
 
-        <!-- Session Realized PNL -->
+        <!-- 1. SESSION - REALIZED PNL -->
         <div class="card">
             <h2>SESSION · REALIZED PNL</h2>
             <div class="stats-grid">
@@ -30,11 +30,11 @@
             </div>
         </div>
 
-        <!-- Settings -->
+        <!-- 2. SETTINGS - SYMBOLS -->
         <div class="card">
             <h2>SETTINGS — SYMBOLS (<span id="symbolCount">0</span>/<span id="totalSymbols">0</span> CHECKED)</h2>
             <div id="symbolsList" class="symbols-grid">
-                <!-- Symbols will be injected by JS -->
+                <!-- Injected by JS -->
             </div>
             <div class="add-symbol">
                 <input type="text" id="newSymbol" placeholder="Add symbol (e.g. SOL)">
@@ -43,7 +43,7 @@
             <p class="info">💡 Only checked symbols are candidates. Autopilot opens them one at a time, only when they qualify — never all at once.</p>
         </div>
 
-        <!-- Trade Setup -->
+        <!-- 3. TRADE SETUP -->
         <div class="card">
             <h2>TRADE SETUP</h2>
             <div class="toggle-row">
@@ -75,6 +75,37 @@
             
             <p class="info">index price = spot · premium price = futures. Futures above spot by ≥ long gap ticks → SHORT. Futures below spot by ≥ short gap ticks → LONG.</p>
         </div>
+
+        <!-- 4. POSITIONS TABLE -->
+        <div class="card">
+            <h2>OPEN POSITIONS</h2>
+            <div class="table-wrapper">
+                <table id="positionsTable">
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Symbol</th>
+                            <th>Side</th>
+                            <th>Entry</th>
+                            <th>Current</th>
+                            <th>PnL</th>
+                        </tr>
+                    </thead>
+                    <tbody id="positionsTableBody">
+                        <tr><td colspan="6" class="no-data">No active positions</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- 5. LOGS -->
+        <div class="card">
+            <h2>SYSTEM LOGS</h2>
+            <div id="logsContainer" class="logs-container">
+                <div class="no-data">No logs yet</div>
+            </div>
+        </div>
+
     </div>
     <script src="script.js"></script>
 </body>
