@@ -10,6 +10,7 @@ h1 span { color: #fff; }
 .card { background-color: #131823; border: 1px solid #1f2633; border-radius: 12px; padding: 15px; margin-bottom: 15px; }
 .card h2 { font-size: 0.75rem; color: #888; letter-spacing: 1px; margin-bottom: 12px; text-transform: uppercase; }
 
+/* Stats Grid */
 .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 0.85rem; color: #aaa; margin-bottom: 15px; }
 .stats-grid span { color: #fff; font-weight: bold; }
 #resetBtn { grid-column: span 2; background: #1f2633; color: #fff; border: none; padding: 8px; border-radius: 6px; cursor: pointer; margin-top: 5px; }
@@ -19,6 +20,7 @@ h1 span { color: #fff; }
 .pnl-value { font-size: 2rem; font-weight: bold; color: #4caf50; margin-top: 5px; }
 .pnl-value.negative { color: #f44336; }
 
+/* Symbols */
 .symbols-grid { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
 .symbol-item { background: #1f2633; border: 1px solid #2a3446; border-radius: 6px; padding: 6px 10px; display: flex; align-items: center; gap: 6px; font-size: 0.85rem; }
 .symbol-item input { accent-color: #f5c542; cursor: pointer; }
@@ -30,6 +32,7 @@ h1 span { color: #fff; }
 
 .info { font-size: 0.75rem; color: #888; line-height: 1.4; }
 
+/* Toggles */
 .toggle-row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
 .switch { position: relative; display: inline-block; width: 40px; height: 22px; }
 .switch input { opacity: 0; width: 0; height: 0; }
@@ -41,3 +44,18 @@ input:checked + .slider:before { transform: translateX(18px); }
 .gap-inputs { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
 .gap-inputs label { display: block; font-size: 0.75rem; color: #888; margin-bottom: 4px; }
 .gap-inputs input { width: 100%; background: #0b0e14; border: 1px solid #1f2633; color: #fff; padding: 8px; border-radius: 6px; }
+
+/* Tables */
+.table-wrapper { overflow-x: auto; margin-top: 10px; }
+#positionsTable { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+#positionsTable th, #positionsTable td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #1f2633; white-space: nowrap; }
+#positionsTable th { color: #888; font-weight: 600; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 0.5px; }
+#positionsTable td { color: #e0e0e0; }
+#positionsTable .pnl-positive { color: #4caf50; }
+#positionsTable .pnl-negative { color: #f44336; }
+.no-data { text-align: center; color: #888; padding: 15px; font-size: 0.8rem; }
+
+/* Logs */
+.logs-container { background: #0b0e14; border: 1px solid #1f2633; border-radius: 6px; padding: 10px; height: 150px; overflow-y: auto; font-family: monospace; font-size: 0.75rem; color: #a0a0a0; line-height: 1.5; }
+.logs-container div { border-bottom: 1px solid #1a1f2b; padding: 4px 0; }
+.logs-container div:last-child { border-bottom: none; }
