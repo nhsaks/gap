@@ -1,49 +1,67 @@
 const express = require('express');
+const cors = require('cors');
 const path = require('path');
 const engine = require('./engine');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Health check for UptimeRobot
-app.get('/health', (req, res) => res.status(200).send('OK'));
+// --- API ROUTES ---
 
-// Frontend polls this every few seconds
-app.get('/api/state', (req, res) => res.json(engine.snapshot()));
-
-// Control endpoints
-app.post('/api/toggle-autopilot', (req, res) => {
-  engine.state.autopilot = !!req.body.on;
-  res.json({ autopilot: engine.state.autopilot });
+// Get current state
+app.get('/api/state', (req, res) => {
+    res.json(engine.getState());
 });
 
-app.post('/api/config', (req, res) => {
-  Object.assign(engine.state, req.body);
-  res.json({ ok: true });
+// Handle actions from the frontend
+app.post('/api/action', (req, res) => {
+    const { action, payload } = req.body;
+    
+    try {
+        switch(action) {
+            case 'toggleAutopilot':
+                engine.toggleAutopilot(payload);
+                break;
+            case 'toggleGapFilter':
+                engine.toggleGapFilter(payload);
+                break;
+            case 'updateGaps':
+                engine.updateGaps(payload.longGap, payload.shortGap);
+                break;
+            case 'toggleSymbol':
+                engine.toggleSymbol(payload.symbol, payload.isChecked);
+                break;
+            case 'addSymbol':
+                engine.addSymbol(payload.symbol);
+                break;
+            case 'reset':
+                engine.reset();
+                break;
+            default:
+                return res.status(400).json({ error: "Unknown action" });
+        }
+        res.json({ success: true, state: engine.getState() });
+    } catch (error) {
+        console.error("Action error:", error);
+        res.status(500).json({ error: "Internal server error" });
+    }
 });
 
-app.post('/api/reset', (req, res) => {
-  engine.state.positions = [];
-  engine.state.realizedPnl = 0;
-  engine.state.realizedFees = 0;
-  engine.state.tradeCount = 0;
-  engine.state.wins = 0;
-  engine.state.losses = 0;
-  engine.state.sessionStart = Date.now();
-  res.json({ ok: true });
-});
+// --- KEEP ALIVE PING (Prevents Render sleep) ---
+// Pings itself every 14 minutes to simulate traffic
+setInterval(() => {
+    const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+    fetch(`${url}/api/state`)
+        .then(() => console.log('Keep-alive ping successful'))
+        .catch(err => console.error('Keep-alive ping failed:', err.message));
+}, 14 * 60 * 1000); // 14 minutes
 
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-app.listen(PORT, async () => {
-  console.log(`Server running on port ${PORT}`);
-  await engine.loadTickSizes();
-  engine.startFeeds();
-  setInterval(engine.autopilotTick, 1000);   // ← runs 24/7
-  console.log('Engine started — autopilot ticking every 1s');
+// --- START SERVER ---
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Keep-alive active. Ping URL: ${process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`}`);
 });
