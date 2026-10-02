@@ -23,26 +23,13 @@ app.post('/api/action', (req, res) => {
     
     try {
         switch(action) {
-            case 'toggleAutopilot':
-                engine.toggleAutopilot(payload);
-                break;
-            case 'toggleGapFilter':
-                engine.toggleGapFilter(payload);
-                break;
-            case 'updateGaps':
-                engine.updateGaps(payload.longGap, payload.shortGap);
-                break;
-            case 'toggleSymbol':
-                engine.toggleSymbol(payload.symbol, payload.isChecked);
-                break;
-            case 'addSymbol':
-                engine.addSymbol(payload.symbol);
-                break;
-            case 'reset':
-                engine.reset();
-                break;
-            default:
-                return res.status(400).json({ error: "Unknown action" });
+            case 'toggleAutopilot': engine.toggleAutopilot(payload); break;
+            case 'toggleGapFilter': engine.toggleGapFilter(payload); break;
+            case 'updateGaps': engine.updateGaps(payload.longGap, payload.shortGap); break;
+            case 'toggleSymbol': engine.toggleSymbol(payload.symbol, payload.isChecked); break;
+            case 'addSymbol': engine.addSymbol(payload.symbol); break;
+            case 'reset': engine.reset(); break;
+            default: return res.status(400).json({ error: "Unknown action" });
         }
         res.json({ success: true, state: engine.getState() });
     } catch (error) {
@@ -52,7 +39,6 @@ app.post('/api/action', (req, res) => {
 });
 
 // --- KEEP ALIVE PING (Prevents Render sleep) ---
-// Pings itself every 14 minutes to simulate traffic
 setInterval(() => {
     const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
     fetch(`${url}/api/state`)
@@ -63,5 +49,4 @@ setInterval(() => {
 // --- START SERVER ---
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
-    console.log(`Keep-alive active. Ping URL: ${process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`}`);
 });
